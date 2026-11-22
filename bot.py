@@ -12,9 +12,15 @@ from urllib.parse import urljoin, urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import ClientDecodeError, TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    ClientDecodeError,
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
 CALENDAR_URL = "https://api.jolpi.ca/ergast/f1/current/races.json?limit=100"
 STREAMS_FILE = Path(__file__).resolve().parent / "webapp" / "streams.json"
@@ -30,6 +36,12 @@ SESSION_NAMES = {
 REMINDER_WINDOW = timedelta(minutes=30)
 REMINDER_RETENTION = timedelta(days=7)
 REMINDER_CLEANUP_INTERVAL = timedelta(hours=1)
+REMINDER_MODES = {"all": "Все сессии", "race": "Только гонки", "off": "Выкл."}
+HOME = "menu:home"
+NEXT_SESSION = "menu:next"
+NOTIFICATIONS = "menu:notifications"
+REMINDER_PREFIX = "reminders:"
+HOME_TEXT = "Формула 1 🏎️\n\nРасписание, трансляции и напоминания о сессиях."
 
 dp = Dispatcher()
 dp.message.filter(F.chat.type == "private")
@@ -42,6 +54,12 @@ class Session:
     race: str
     name: str
     starts_at: datetime
+
+
+@dataclass
+class RaceData:
+    streams: dict
+    sessions: list[Session] | None = None
 
 
 def calendar_sessions(races: object) -> list[Session]:
@@ -84,7 +102,10 @@ def calendar_sessions(races: object) -> list[Session]:
 
 def init_db(db: sqlite3.Connection) -> None:
     db.executescript("""
-        CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS subscribers (
+            chat_id INTEGER PRIMARY KEY,
+            mode TEXT NOT NULL DEFAULT 'all' CHECK (mode IN ('all', 'race'))
+        );
         CREATE TABLE IF NOT EXISTS reminders (
             session_id TEXT NOT NULL,
             chat_id INTEGER NOT NULL,
@@ -94,6 +115,12 @@ def init_db(db: sqlite3.Connection) -> None:
     """)
     with db:
         db.execute("BEGIN IMMEDIATE")
+        subscriber_columns = {column[1] for column in db.execute("PRAGMA table_info(subscribers)")}
+        if "mode" not in subscriber_columns:
+            db.execute("""
+                ALTER TABLE subscribers
+                ADD COLUMN mode TEXT NOT NULL DEFAULT 'all' CHECK (mode IN ('all', 'race'))
+            """)
         columns = {column[1] for column in db.execute("PRAGMA table_info(reminders)")}
         if "recorded_at" not in columns:
             db.execute("ALTER TABLE reminders ADD COLUMN recorded_at INTEGER NOT NULL DEFAULT 0")
@@ -109,39 +136,125 @@ def prune_reminders(db: sqlite3.Connection, now: datetime) -> None:
 
 @dp.message(CommandStart())
 async def start(message: Message, webapp_url: str | None) -> None:
-    text = (
-        "Привет! Я бот про Формулу 1 🏎️\n\n"
-        "/subscribe — напоминания за 30 минут до сессий\n"
-        "/unsubscribe — отключить напоминания"
-    )
-    keyboard = None
+    await message.answer(HOME_TEXT, reply_markup=home_keyboard(webapp_url))
+
+
+def home_keyboard(webapp_url: str | None) -> InlineKeyboardMarkup:
+    rows = []
     if webapp_url:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Открыть приложение", web_app=WebAppInfo(url=webapp_url)),
-        ]])
-    await message.answer(text, reply_markup=keyboard)
+        rows.append([
+            InlineKeyboardButton(text="📅 Полное расписание", web_app=WebAppInfo(url=webapp_url)),
+        ])
+    rows += [
+        [InlineKeyboardButton(text="🏁 Ближайшая сессия", callback_data=NEXT_SESSION)],
+        [InlineKeyboardButton(text="🔔 Уведомления", callback_data=NOTIFICATIONS)],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def set_reminder_mode(db: sqlite3.Connection, chat_id: int, mode: str) -> None:
+    with db:
+        if mode == "off":
+            db.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
+        else:
+            db.execute("""
+                INSERT INTO subscribers (chat_id, mode) VALUES (?, ?)
+                ON CONFLICT (chat_id) DO UPDATE SET mode = excluded.mode
+            """, (chat_id, mode))
 
 
 @dp.message(Command("subscribe"))
 async def subscribe(message: Message, db: sqlite3.Connection) -> None:
-    with db:
-        db.execute("INSERT OR IGNORE INTO subscribers VALUES (?)", (message.chat.id,))
-    await message.answer("Напоминания включены. Отключить их можно командой /unsubscribe.")
+    set_reminder_mode(db, message.chat.id, "all")
+    await message.answer("Напоминания включены для всех сессий. Отключить их можно командой /unsubscribe.")
 
 
 @dp.message(Command("unsubscribe"))
 async def unsubscribe(message: Message, db: sqlite3.Connection) -> None:
-    with db:
-        db.execute("DELETE FROM subscribers WHERE chat_id = ?", (message.chat.id,))
+    set_reminder_mode(db, message.chat.id, "off")
     await message.answer("Напоминания отключены.")
 
 
-def stream_keyboard(streams: dict, session_id: str) -> InlineKeyboardMarkup | None:
+def notifications_screen(db: sqlite3.Connection, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    row = db.execute("SELECT mode FROM subscribers WHERE chat_id = ?", (chat_id,)).fetchone()
+    current = row[0] if row else "off"
+    rows = [
+        [InlineKeyboardButton(
+            text=f"✓ {label}" if mode == current else label,
+            callback_data=f"{REMINDER_PREFIX}{mode}",
+        )]
+        for mode, label in REMINDER_MODES.items()
+    ]
+    rows.append([InlineKeyboardButton(text="‹ Главное меню", callback_data=HOME)])
+    text = f"🔔 Уведомления\n\nРежим — {REMINDER_MODES[current]}.\nНапоминания приходят примерно за 30 минут."
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def next_session_screen(race_data: RaceData) -> tuple[str, InlineKeyboardMarkup]:
+    rows = []
+    now = datetime.now(UTC)
+    upcoming = next((session for session in race_data.sessions or [] if session.starts_at > now), None)
+    if upcoming:
+        minutes = math.ceil((upcoming.starts_at - now).total_seconds() / 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+        remaining = " ".join(
+            f"{value} {unit}" for value, unit in ((days, "д"), (hours, "ч"), (minutes, "мин")) if value
+        )
+        text = f"🏁 {upcoming.race}\n{upcoming.name} через {remaining}."
+        keyboard = stream_keyboard(race_data.streams, upcoming.id, highlight_direct=True)
+        if keyboard:
+            rows.extend(keyboard.inline_keyboard)
+    elif race_data.sessions is None:
+        text = "Расписание пока недоступно. Попробуйте обновить карточку через минуту."
+        rows.append([InlineKeyboardButton(text="Обновить", callback_data=NEXT_SESSION)])
+    else:
+        text = "В календаре пока нет предстоящих сессий."
+
+    rows.append([InlineKeyboardButton(text="‹ Главное меню", callback_data=HOME)])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.in_({
+    HOME, NEXT_SESSION, NOTIFICATIONS, *(f"{REMINDER_PREFIX}{mode}" for mode in REMINDER_MODES),
+}))
+async def open_menu(
+    callback: CallbackQuery, db: sqlite3.Connection, webapp_url: str | None, race_data: RaceData,
+) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.type != "private" or message.chat.id != callback.from_user.id:
+        await callback.answer("Откройте меню командой /start.", show_alert=True)
+        return
+
+    action = callback.data or ""
+    if action.startswith(REMINDER_PREFIX):
+        set_reminder_mode(db, message.chat.id, action.removeprefix(REMINDER_PREFIX))
+    await callback.answer()
+
+    if action == HOME:
+        text, keyboard = HOME_TEXT, home_keyboard(webapp_url)
+    elif action == NEXT_SESSION:
+        text, keyboard = next_session_screen(race_data)
+    else:
+        text, keyboard = notifications_screen(db, message.chat.id)
+
+    if message.text == text and message.reply_markup == keyboard:
+        return
+    try:
+        await message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest as error:
+        if "message is not modified" not in error.message.lower():
+            raise
+
+
+def stream_keyboard(
+    streams: dict, session_id: str, *, highlight_direct: bool = False,
+) -> InlineKeyboardMarkup | None:
     direct = streams["sessions"].get(session_id, [])
     sources = direct if isinstance(direct, list) else []
     rows = []
     labels = set()
-    for source in [*sources, *streams["sources"]]:
+    for index, source in enumerate([*sources, *streams["sources"]]):
         if not isinstance(source, dict):
             continue
         label, url = source.get("label"), source.get("url")
@@ -152,7 +265,9 @@ def stream_keyboard(streams: dict, session_id: str) -> InlineKeyboardMarkup | No
         except ValueError:
             continue
         if parsed.scheme == "https" and parsed.hostname:
-            rows.append([InlineKeyboardButton(text=label, url=url)])
+            is_primary = highlight_direct and not rows and index < len(sources)
+            text = "▶ Смотреть эфир" if is_primary else label
+            rows.append([InlineKeyboardButton(text=text, url=url)])
             labels.add(label)
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
@@ -165,12 +280,14 @@ async def send_reminders(
     for session in sessions:
         if not now < session.starts_at <= now + REMINDER_WINDOW:
             continue
+        is_race = session.id.endswith(":Race")
         recipients = db.execute("""
             SELECT chat_id FROM subscribers
-            WHERE NOT EXISTS (
+            WHERE (mode = 'all' OR ?)
+            AND NOT EXISTS (
                 SELECT 1 FROM reminders WHERE session_id = ? AND chat_id = subscribers.chat_id
             )
-        """, (session.id,)).fetchall()
+        """, (is_race, session.id)).fetchall()
         keyboard = stream_keyboard(streams, session.id)
         for (chat_id,) in recipients:
             seconds_left = (session.starts_at - datetime.now(UTC)).total_seconds()
@@ -180,7 +297,8 @@ async def send_reminders(
                 claimed = db.execute("""
                     INSERT OR IGNORE INTO reminders (session_id, chat_id, recorded_at)
                     SELECT ?, chat_id, ? FROM subscribers WHERE chat_id = ?
-                """, (session.id, recorded_at, chat_id)).rowcount
+                    AND (mode = 'all' OR ?)
+                """, (session.id, recorded_at, chat_id, is_race)).rowcount
             if not claimed:
                 continue
 
@@ -203,9 +321,9 @@ async def send_reminders(
     return 0
 
 
-async def notification_loop(bot: Bot, db: sqlite3.Connection, webapp_url: str | None) -> None:
-    streams = json.loads(STREAMS_FILE.read_text(encoding="utf-8"))
-    sessions = []
+async def notification_loop(
+    bot: Bot, db: sqlite3.Connection, webapp_url: str | None, race_data: RaceData,
+) -> None:
     refresh_calendar = refresh_streams = cleanup_at = 0.0
     loop = asyncio.get_running_loop()
     async with ClientSession(timeout=ClientTimeout(total=10), raise_for_status=True) as http:
@@ -218,7 +336,7 @@ async def notification_loop(bot: Bot, db: sqlite3.Connection, webapp_url: str | 
                 try:
                     async with http.get(CALENDAR_URL) as response:
                         data = await response.json()
-                    sessions = calendar_sessions(data["MRData"]["RaceTable"]["Races"])
+                    race_data.sessions = calendar_sessions(data["MRData"]["RaceTable"]["Races"])
                 except (ClientError, TimeoutError, ValueError, KeyError, TypeError) as error:
                     log.warning("Не удалось обновить календарь Jolpica (%s)", type(error).__name__)
                     refresh_calendar = loop.time() + 60
@@ -230,12 +348,12 @@ async def notification_loop(bot: Bot, db: sqlite3.Connection, webapp_url: str | 
                     async with http.get(urljoin(webapp_url, "streams.json")) as response:
                         catalog = await response.json()
                     if isinstance(catalog["sources"], list) and isinstance(catalog["sessions"], dict):
-                        streams = catalog
+                        race_data.streams = catalog
                 except (ClientError, TimeoutError, ValueError, KeyError, TypeError):
                     log.warning("Не удалось обновить список трансляций с Mini App")
                 refresh_streams = loop.time() + 300
 
-            retry_after = await send_reminders(bot, db, sessions, streams)
+            retry_after = await send_reminders(bot, db, race_data.sessions or [], race_data.streams)
             await asyncio.sleep(max(30, retry_after))
 
 
@@ -254,10 +372,11 @@ async def main() -> None:
 
     with closing(sqlite3.connect(os.environ.get("DB_PATH", "f1.sqlite3"))) as db:
         init_db(db)
+        race_data = RaceData(streams=json.loads(STREAMS_FILE.read_text(encoding="utf-8")))
         async with Bot(token) as bot, asyncio.TaskGroup() as tasks:
-            notifications = tasks.create_task(notification_loop(bot, db, webapp_url))
+            notifications = tasks.create_task(notification_loop(bot, db, webapp_url, race_data))
             try:
-                await dp.start_polling(bot, db=db, webapp_url=webapp_url, close_bot_session=False)
+                await dp.start_polling(bot, db=db, webapp_url=webapp_url, race_data=race_data, close_bot_session=False)
             finally:
                 notifications.cancel()
 

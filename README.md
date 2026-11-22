@@ -18,7 +18,9 @@ export WEBAPP_URL=https://mamonovv.github.io/f1-telegram-app/
 .venv/bin/python bot.py
 ```
 
-Откройте чат с ботом и проверьте `/start`, `/subscribe` и `/unsubscribe`. До публикации Mini App пропустите строку с `WEBAPP_URL`. Для просмотра страницы вне Telegram запустите `python3 -m http.server 8000 --directory webapp` и откройте `http://localhost:8000`.
+Откройте чат с ботом и отправьте `/start`. В меню есть **Полное расписание**, **Ближайшая сессия** и **Уведомления**. У уведомлений три режима — **Все сессии**, **Только гонки** и **Выкл.** Команды `/subscribe` и `/unsubscribe` включают все напоминания и отключают их соответственно.
+
+До публикации Mini App пропустите строку с `WEBAPP_URL`. Для просмотра страницы вне Telegram запустите `python3 -m http.server 8000 --directory webapp` и откройте `http://localhost:8000`.
 
 ## Трансляции
 

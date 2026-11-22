@@ -8,10 +8,23 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram import Bot
 from aiogram.exceptions import ClientDecodeError, TelegramRetryAfter
-from aiogram.methods import SendMessage
-from aiogram.types import Chat, Message, Update, User
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
+from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
-from bot import REMINDER_RETENTION, Session, calendar_sessions, dp, init_db, prune_reminders, send_reminders
+from bot import (
+    HOME,
+    NEXT_SESSION,
+    NOTIFICATIONS,
+    REMINDER_RETENTION,
+    RaceData,
+    Session,
+    calendar_sessions,
+    dp,
+    init_db,
+    prune_reminders,
+    send_reminders,
+    set_reminder_mode,
+)
 
 
 class RemindersTest(unittest.IsolatedAsyncioTestCase):
@@ -33,7 +46,53 @@ class RemindersTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(request.await_count, 3)
                     method = request.await_args_list[0].args[1]
                     self.assertEqual(method.reply_markup.inline_keyboard[0][0].web_app.url, webapp_url)
+                    self.assertEqual(
+                        [row[0].callback_data for row in method.reply_markup.inline_keyboard[1:]],
+                        [NEXT_SESSION, NOTIFICATIONS],
+                    )
                     self.assertEqual(db.execute("SELECT chat_id FROM subscribers").fetchall(), [])
+
+    async def test_menu_callbacks_edit_message_and_save_reminder_mode(self):
+        now = datetime.now(UTC)
+        race_data = RaceData(
+            streams={
+                "sources": [],
+                "sessions": {"2026:22:Race": [{"label": "Эфир", "url": "https://example.org/live"}]},
+            },
+            sessions=[Session("2026:22:Race", "Qatar Grand Prix", "Гонка", now + timedelta(hours=2))],
+        )
+        user = User(id=42, is_bot=False, first_name="Tester")
+        message = Message(message_id=1, date=now, text="Меню", chat=Chat(id=42, type="private"))
+        with closing(sqlite3.connect(":memory:")) as db:
+            init_db(db)
+            async with Bot("1:test") as bot:
+                with patch.object(bot.session, "make_request", new_callable=AsyncMock) as request:
+                    async def tap(action):
+                        update = Update(update_id=request.await_count, callback_query=CallbackQuery(
+                            id=action, from_user=user, chat_instance="private", message=message, data=action,
+                        ))
+                        await dp.feed_update(bot, update, db=db, webapp_url=None, race_data=race_data)
+                        self.assertIsInstance(request.await_args_list[-2].args[1], AnswerCallbackQuery)
+                        edit = request.await_args.args[1]
+                        self.assertIsInstance(edit, EditMessageText)
+                        self.assertEqual(edit.message_id, message.message_id)
+                        return edit
+
+                    edit = await tap(NOTIFICATIONS)
+                    self.assertIn("Выкл.", edit.text)
+                    for mode, label in (
+                        ("race", "Только гонки"), ("all", "Все сессии"), ("off", "Выкл."),
+                    ):
+                        edit = await tap(f"reminders:{mode}")
+                        self.assertIn(f"✓ {label}", [row[0].text for row in edit.reply_markup.inline_keyboard])
+                        expected = [] if mode == "off" else [(mode,)]
+                        self.assertEqual(db.execute("SELECT mode FROM subscribers").fetchall(), expected)
+
+                    edit = await tap(NEXT_SESSION)
+                    self.assertIn("Гонка через 2 ч", edit.text)
+                    self.assertEqual(edit.reply_markup.inline_keyboard[0][0].text, "▶ Смотреть эфир")
+                    self.assertEqual(edit.reply_markup.inline_keyboard[0][0].url, "https://example.org/live")
+                    self.assertEqual((await tap(HOME)).reply_markup.inline_keyboard[0][0].callback_data, NEXT_SESSION)
 
     def test_calendar_orders_sessions_and_skips_unknown_start(self):
         race = {
@@ -81,7 +140,7 @@ class RemindersTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute("SELECT recorded_at FROM reminders").fetchall(), [(recorded_at,)])
             prune_reminders(db, expires_at)
             self.assertEqual(db.execute("SELECT chat_id FROM reminders").fetchall(), [])
-            self.assertEqual(db.execute("SELECT chat_id FROM subscribers").fetchall(), [(42,)])
+            self.assertEqual(db.execute("SELECT chat_id, mode FROM subscribers").fetchall(), [(42, "all")])
 
     async def test_telegram_decode_error_does_not_interrupt_other_reminders(self):
         fake_bot = AsyncMock()
@@ -94,7 +153,7 @@ class RemindersTest(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(":memory:")) as db:
             init_db(db)
             with db:
-                db.executemany("INSERT INTO subscribers VALUES (?)", [(1,), (2,)])
+                db.executemany("INSERT INTO subscribers (chat_id) VALUES (?)", [(1,), (2,)])
             with self.assertLogs("bot", "WARNING") as logs:
                 await send_reminders(fake_bot, db, sessions, streams)
             await send_reminders(fake_bot, db, sessions, streams)
@@ -120,20 +179,45 @@ class RemindersTest(unittest.IsolatedAsyncioTestCase):
             with closing(sqlite3.connect(path)) as db:
                 init_db(db)
                 with db:
-                    db.execute("INSERT INTO subscribers VALUES (1)")
+                    db.execute("INSERT INTO subscribers (chat_id) VALUES (1)")
                 await send_reminders(fake_bot, db, sessions, streams)
 
             with closing(sqlite3.connect(path)) as db:
                 init_db(db)
                 with db:
-                    db.execute("INSERT INTO subscribers VALUES (2)")
-                    db.execute("INSERT INTO subscribers VALUES (3)")
+                    db.execute("INSERT INTO subscribers (chat_id) VALUES (2)")
+                    db.execute("INSERT INTO subscribers (chat_id) VALUES (3)")
                     db.execute("DELETE FROM subscribers WHERE chat_id = 3")
                 await send_reminders(fake_bot, db, sessions, streams)
 
         calls = fake_bot.send_message.await_args_list
         self.assertEqual([call.args[0] for call in calls], [1, 2])
         self.assertEqual(calls[0].kwargs["reply_markup"].inline_keyboard[0][0].url, "https://example.org/live")
+
+    async def test_race_only_mode_survives_restart_and_skips_practice(self):
+        fake_bot = AsyncMock()
+        now = datetime.now(UTC)
+        sessions = [
+            Session("2026:22:FirstPractice", "Qatar Grand Prix", "Практика 1", now + timedelta(minutes=10)),
+            Session("2026:22:Race", "Qatar Grand Prix", "Гонка", now + timedelta(minutes=20)),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            with closing(sqlite3.connect(path)) as db:
+                init_db(db)
+                set_reminder_mode(db, 1, "race")
+                set_reminder_mode(db, 2, "all")
+
+            with closing(sqlite3.connect(path)) as db:
+                init_db(db)
+                await send_reminders(fake_bot, db, sessions, {"sources": [], "sessions": {}})
+
+        calls_by_mode = [(call.args[0], call.args[1].splitlines()[1]) for call in fake_bot.send_message.await_args_list]
+        self.assertCountEqual(calls_by_mode, [
+            (2, "Практика 1 через 10 мин."),
+            (1, "Гонка через 20 мин."),
+            (2, "Гонка через 20 мин."),
+        ])
 
     async def test_telegram_rate_limit_can_be_retried(self):
         fake_bot = AsyncMock()
@@ -146,7 +230,7 @@ class RemindersTest(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(":memory:")) as db:
             init_db(db)
             with db:
-                db.execute("INSERT INTO subscribers VALUES (1)")
+                db.execute("INSERT INTO subscribers (chat_id) VALUES (1)")
             self.assertEqual(await send_reminders(fake_bot, db, sessions, streams), 5)
             self.assertEqual(await send_reminders(fake_bot, db, sessions, streams), 0)
             await send_reminders(fake_bot, db, sessions, streams)
