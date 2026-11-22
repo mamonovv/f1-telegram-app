@@ -1,54 +1,79 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>F1</title>
-<script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-<script src="app.js" defer></script>
-<style>
-  :root {
-    --bg: var(--tg-theme-bg-color, #fff);
-    --text: var(--tg-theme-text-color, #111);
-    --hint: var(--tg-theme-hint-color, #888);
-    --accent: var(--tg-theme-button-color, #e10600);
-    --accent-text: var(--tg-theme-button-text-color, #fff);
-    --card: var(--tg-theme-secondary-bg-color, #f2f2f2);
-  }
-  body { margin: 0; font: 15px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--text); }
-  nav { display: flex; position: sticky; top: 0; z-index: 1; background: var(--bg); border-bottom: 1px solid var(--card); }
-  nav button { flex: 1; padding: 12px 4px; border: 0; background: none; color: var(--hint); font: inherit; cursor: pointer; }
-  nav button[aria-selected="true"] { color: var(--accent); box-shadow: inset 0 -2px var(--accent); }
-  main { padding: 12px; }
-  h2 { font-size: 17px; margin: 16px 0 8px; }
-  .card { background: var(--card); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
-  .card.next { outline: 2px solid var(--accent); }
-  .muted { color: var(--hint); font-size: 13px; }
-  .countdown { font-size: 22px; font-weight: 600; margin: 4px 0; }
-  table { width: 100%; border-collapse: collapse; }
-  td, th { padding: 6px 4px; text-align: left; border-bottom: 1px solid var(--card); }
-  th { color: var(--hint); font-weight: normal; font-size: 13px; }
-  td.num, th.num { text-align: right; }
-  .sessions { margin: 6px 0 0; padding: 0; list-style: none; font-size: 14px; }
-  .sessions li { display: flex; justify-content: space-between; }
-  .sessions li span:last-child { text-align: right; }
-  summary { cursor: pointer; }
-  .past summary { color: var(--hint); }
-  .seg { display: flex; gap: 6px; margin-bottom: 8px; }
-  .seg button { flex: 1; padding: 8px; border-radius: 8px; border: 0; background: var(--card); color: var(--text); font: inherit; }
-  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
-  .stream { display: block; text-align: center; padding: 12px; border-radius: 12px; background: var(--accent); color: var(--accent-text); text-decoration: none; font-weight: 600; }
-  .stream-options { margin-top: 8px; }
-  .stream-options a { display: inline-block; margin: 6px 12px 0 0; color: var(--text); }
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111115">
+    <title>Формула 1</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://telegram.org/js/telegram-web-app.js?65" defer></script>
+    <script src="app.js" defer></script>
 </head>
 <body>
-<nav role="tablist" aria-label="Формула 1">
-  <button type="button" id="tab-schedule" role="tab" aria-controls="app" aria-selected="true" data-tab="schedule">Расписание</button>
-  <button type="button" id="tab-standings" role="tab" aria-controls="app" aria-selected="false" tabindex="-1" data-tab="standings">Таблица</button>
-  <button type="button" id="tab-results" role="tab" aria-controls="app" aria-selected="false" tabindex="-1" data-tab="results">Результаты</button>
-</nav>
-<main id="app" role="tabpanel" aria-labelledby="tab-schedule" tabindex="0"><p class="muted">Загрузка…</p></main>
+    <header class="site-header">
+        <div class="shell">
+            <div class="site-header__brand">Формула 1</div>
+            <nav class="tabs" role="tablist" aria-label="Разделы">
+                <button class="tabs__button"
+                        type="button"
+                        id="tab-schedule"
+                        role="tab"
+                        aria-controls="app"
+                        aria-selected="true"
+                        data-tab="schedule">
+                    Расписание
+                </button>
+                <button class="tabs__button"
+                        type="button"
+                        id="tab-standings"
+                        role="tab"
+                        aria-controls="app"
+                        aria-selected="false"
+                        tabindex="-1"
+                        data-tab="standings">
+                    Таблица
+                </button>
+                <button class="tabs__button"
+                        type="button"
+                        id="tab-results"
+                        role="tab"
+                        aria-controls="app"
+                        aria-selected="false"
+                        tabindex="-1"
+                        data-tab="results">
+                    Результаты
+                </button>
+            </nav>
+        </div>
+    </header>
 
+    <main class="shell"
+          id="app"
+          role="tabpanel"
+          aria-labelledby="tab-schedule"
+          tabindex="0">
+        <section class="standings-controls" id="standings-controls" hidden>
+            <h1 class="standings-controls__title">Зачёт сезона</h1>
+            <div class="seg" role="group" aria-label="Вид зачёта">
+                <button class="seg__button"
+                        type="button"
+                        data-mode="drivers"
+                        aria-pressed="true">
+                    Пилоты
+                </button>
+                <button class="seg__button"
+                        type="button"
+                        data-mode="constructors"
+                        aria-pressed="false">
+                    Команды
+                </button>
+            </div>
+        </section>
+        <div class="loader" id="app-loader" role="status">
+            <span class="loader__ring" aria-hidden="true"></span>
+            <span class="sr-only">Загрузка данных</span>
+        </div>
+        <div id="view" aria-busy="true"></div>
+    </main>
 </body>
 </html>
