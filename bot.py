@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import ClientDecodeError, TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
@@ -28,6 +28,8 @@ SESSION_NAMES = {
     "Race": "Гонка",
 }
 REMINDER_WINDOW = timedelta(minutes=30)
+REMINDER_RETENTION = timedelta(days=7)
+REMINDER_CLEANUP_INTERVAL = timedelta(hours=1)
 
 dp = Dispatcher()
 dp.message.filter(F.chat.type == "private")
@@ -42,20 +44,40 @@ class Session:
     starts_at: datetime
 
 
-def calendar_sessions(races: list[dict]) -> list[Session]:
+def calendar_sessions(races: object) -> list[Session]:
+    if not isinstance(races, list):
+        raise ValueError("Календарь должен содержать список этапов")
+
     sessions = []
     for race in races:
+        if not isinstance(race, dict):
+            raise ValueError("Неверная структура этапа")
+        season = str(race.get("season"))
+        round_number = str(race.get("round"))
+        race_name = race.get("raceName")
+        if not season.isdecimal() or not round_number.isdecimal():
+            raise ValueError("Неверный сезон или номер этапа")
+        if not isinstance(race_name, str):
+            raise ValueError("Неверное название этапа")
+
         for key, name in SESSION_NAMES.items():
             slot = race if key == "Race" else race.get(key)
-            if key == "SprintQualifying" and not slot:
+            if key == "SprintQualifying" and slot in (None, {}):
                 slot = race.get("SprintShootout")
-            if not slot or not slot.get("date") or not slot.get("time"):
+            if slot is None:
                 continue
-            starts_at = datetime.fromisoformat(f"{slot['date']}T{slot['time']}")
+            if not isinstance(slot, dict):
+                raise ValueError("Неверная структура сессии")
+            date, time = slot.get("date"), slot.get("time")
+            if date in (None, "") or time in (None, ""):
+                continue
+            if not isinstance(date, str) or not isinstance(time, str):
+                raise ValueError("Неверная дата или время сессии")
+            starts_at = datetime.fromisoformat(f"{date}T{time}")
             if starts_at.tzinfo is None:
                 starts_at = starts_at.replace(tzinfo=UTC)
             sessions.append(Session(
-                f"{race['season']}:{race['round']}:{key}", race["raceName"], name, starts_at
+                f"{season}:{round_number}:{key}", race_name, name, starts_at
             ))
     return sorted(sessions, key=lambda session: session.starts_at)
 
@@ -66,9 +88,23 @@ def init_db(db: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS reminders (
             session_id TEXT NOT NULL,
             chat_id INTEGER NOT NULL,
+            recorded_at INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (session_id, chat_id)
         );
     """)
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        columns = {column[1] for column in db.execute("PRAGMA table_info(reminders)")}
+        if "recorded_at" not in columns:
+            db.execute("ALTER TABLE reminders ADD COLUMN recorded_at INTEGER NOT NULL DEFAULT 0")
+            # Keep deduplication for existing rows whose original send time is unknown.
+            db.execute("UPDATE reminders SET recorded_at = ?", (int(datetime.now(UTC).timestamp()),))
+
+
+def prune_reminders(db: sqlite3.Connection, now: datetime) -> None:
+    cutoff = int((now - REMINDER_RETENTION).timestamp())
+    with db:
+        db.execute("DELETE FROM reminders WHERE recorded_at <= ?", (cutoff,))
 
 
 @dp.message(CommandStart())
@@ -125,6 +161,7 @@ async def send_reminders(
     bot: Bot, db: sqlite3.Connection, sessions: list[Session], streams: dict,
 ) -> int:
     now = datetime.now(UTC)
+    recorded_at = int(now.timestamp())
     for session in sessions:
         if not now < session.starts_at <= now + REMINDER_WINDOW:
             continue
@@ -141,9 +178,9 @@ async def send_reminders(
                 break
             with db:
                 claimed = db.execute("""
-                    INSERT OR IGNORE INTO reminders
-                    SELECT ?, chat_id FROM subscribers WHERE chat_id = ?
-                """, (session.id, chat_id)).rowcount
+                    INSERT OR IGNORE INTO reminders (session_id, chat_id, recorded_at)
+                    SELECT ?, chat_id, ? FROM subscribers WHERE chat_id = ?
+                """, (session.id, recorded_at, chat_id)).rowcount
             if not claimed:
                 continue
 
@@ -160,26 +197,30 @@ async def send_reminders(
             except TelegramForbiddenError:
                 with db:
                     db.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
-            except TelegramAPIError:
+            except (ClientDecodeError, TelegramAPIError) as error:
                 # shortcut: keep the claim when delivery is uncertain, until Telegram supports idempotent sends.
-                log.exception("Ошибка отправки напоминания для сессии %s", session.id)
+                log.warning("Ошибка отправки напоминания для сессии %s (%s)", session.id, type(error).__name__)
     return 0
 
 
 async def notification_loop(bot: Bot, db: sqlite3.Connection, webapp_url: str | None) -> None:
     streams = json.loads(STREAMS_FILE.read_text(encoding="utf-8"))
     sessions = []
-    refresh_calendar = refresh_streams = 0.0
+    refresh_calendar = refresh_streams = cleanup_at = 0.0
     loop = asyncio.get_running_loop()
     async with ClientSession(timeout=ClientTimeout(total=10), raise_for_status=True) as http:
         while True:
+            if loop.time() >= cleanup_at:
+                prune_reminders(db, datetime.now(UTC))
+                cleanup_at = loop.time() + REMINDER_CLEANUP_INTERVAL.total_seconds()
+
             if loop.time() >= refresh_calendar:
                 try:
                     async with http.get(CALENDAR_URL) as response:
                         data = await response.json()
                     sessions = calendar_sessions(data["MRData"]["RaceTable"]["Races"])
-                except (ClientError, TimeoutError, ValueError, KeyError, TypeError):
-                    log.exception("Не удалось обновить календарь Jolpica")
+                except (ClientError, TimeoutError, ValueError, KeyError, TypeError) as error:
+                    log.warning("Не удалось обновить календарь Jolpica (%s)", type(error).__name__)
                     refresh_calendar = loop.time() + 60
                 else:
                     refresh_calendar = loop.time() + 3600
