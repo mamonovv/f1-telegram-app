@@ -28,6 +28,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/configure-pages@v5
+      - name: Version JavaScript URL
+        run: sed -i 's/src="app.js"/src="app.js?v=${{ github.sha }}"/' webapp/index.html
       - uses: actions/upload-pages-artifact@v4
         with:
           path: webapp
