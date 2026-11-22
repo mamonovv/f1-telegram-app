@@ -127,10 +127,17 @@ async function renderSchedule() {
         <b>${esc(race.round)}. ${esc(race.raceName)}</b>
         <div class="muted">${esc(race.Circuit.Location.locality)}, ${esc(race.Circuit.Location.country)} · ${day(race)}</div>
       </summary>
-      <ul class="sessions">${sessionsOf(race).map(session => `<li>
-        <span>${esc(session.name)}</span>
-        <span>${session.at ? when(session.at) : `${day(session.slot)} · время уточняется`}</span>
-      </li>`).join('')}</ul>
+      <ul class="sessions">${sessionsOf(race).map(session => {
+        const links = streams.sessions?.[sessionId(race, session.key)] || [];
+        const time = session.at ? when(session.at) : `${day(session.slot)} · время уточняется`;
+        return `<li>
+          <div>
+            ${esc(session.name)}
+            ${links.length ? `<div class="stream-options">${links.map(source => streamLink(source)).join('')}</div>` : ''}
+          </div>
+          <span>${time}</span>
+        </li>`;
+      }).join('')}</ul>
     </details>`;
   }
   return html;

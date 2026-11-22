@@ -4,15 +4,37 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
+from aiogram.types import Chat, Message, Update, User
 
-from bot import Session, calendar_sessions, init_db, send_reminders
+from bot import Session, calendar_sessions, dp, init_db, send_reminders
 
 
 class RemindersTest(unittest.IsolatedAsyncioTestCase):
+    async def test_bot_commands(self):
+        webapp_url = "https://example.org/app/"
+        with closing(sqlite3.connect(":memory:")) as db:
+            init_db(db)
+            async with Bot("1:test") as bot:
+                with patch.object(bot.session, "make_request", new_callable=AsyncMock) as request:
+                    for index, command in enumerate(("/start", "/subscribe", "/unsubscribe"), 1):
+                        update = Update(update_id=index, message=Message(
+                            message_id=index, date=datetime.now(UTC), text=command,
+                            chat=Chat(id=42, type="private"),
+                            from_user=User(id=42, is_bot=False, first_name="Tester"),
+                        ))
+                        await dp.feed_update(bot, update, db=db, webapp_url=webapp_url)
+                        if command == "/subscribe":
+                            self.assertEqual(db.execute("SELECT chat_id FROM subscribers").fetchall(), [(42,)])
+                    self.assertEqual(request.await_count, 3)
+                    method = request.await_args_list[0].args[1]
+                    self.assertEqual(method.reply_markup.inline_keyboard[0][0].web_app.url, webapp_url)
+                    self.assertEqual(db.execute("SELECT chat_id FROM subscribers").fetchall(), [])
+
     def test_calendar_orders_sessions_and_skips_unknown_start(self):
         race = {
             "season": "2026", "round": "1", "raceName": "Grand Prix",
