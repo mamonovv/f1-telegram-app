@@ -1,0 +1,17 @@
+[Unit]
+Description=Formula 1 Telegram bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=f1-telegram-bot
+WorkingDirectory=/var/lib/f1-telegram-bot
+EnvironmentFile=/etc/f1-telegram-bot.env
+ExecStart=/opt/f1-telegram-app/.venv/bin/python /opt/f1-telegram-app/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

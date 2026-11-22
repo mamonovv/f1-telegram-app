@@ -1,0 +1,16 @@
+{
+  "sources": [
+    {"label": "StanizlavskyLIVE", "url": "https://rutube.ru/channel/35504962/"},
+    {"label": "Вершина Автоспорта", "url": "https://rutube.ru/u/versporta/"},
+    {"label": "F1 TV", "url": "https://www.formula1.com/en/page/what-is-f1-tv-pro"}
+  ],
+  "sessions": {
+    "2026:21:Race": [
+      {"label": "StanizlavskyLIVE", "url": "https://rutube.ru/video/c2606c9ab500e2366ab31511c6ca5dfa/"}
+    ],
+    "2026:21:Qualifying": [
+      {"label": "StanizlavskyLIVE", "url": "https://rutube.ru/video/6048037528f0c71cbb40e4d119d0f153/"},
+      {"label": "Вершина Автоспорта", "url": "https://rutube.ru/video/b74a7cc3690cd6948ffb42352587a0b9/"}
+    ]
+  }
+}
